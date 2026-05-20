@@ -8,6 +8,9 @@ GramiVox is a macOS SwiftUI utility app that:
 - loads ChatGPT in a private `WKWebView` session
 - fills the prompt with `fix grammar or rephrase: [SELECTED TEXT]`
 
+<img width="1280" height="720" alt="demo" src="https://github.com/user-attachments/assets/41c31109-0e91-4297-be02-1e84672f4001" />
+
+
 ## Build
 
 ```bash
