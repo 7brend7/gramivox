@@ -157,7 +157,6 @@ struct ChatGPTWebView: NSViewRepresentable {
         )
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
-        webView.isInspectable = true
         webView.navigationDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
         model.attach(webView)
