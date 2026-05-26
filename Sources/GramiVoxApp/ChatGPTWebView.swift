@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import WebKit
 
@@ -23,7 +24,11 @@ final class ChatGPTWebViewModel: ObservableObject {
         guard let promptJSON = prompt.jsonEncodedForJavaScript else { return }
 
         let script = "window.__gramivoxSetPrompt(\(promptJSON));"
-        webView.evaluateJavaScript(script)
+        webView.evaluateJavaScript(script) { [weak self] _, _ in
+            Task { @MainActor in
+                await self?.clickComposerSubmitButtonUntilSuccessful()
+            }
+        }
     }
 
     func selectedReplyText(fallbackToLatestReply: Bool = false) async -> String? {
@@ -41,6 +46,95 @@ final class ChatGPTWebViewModel: ObservableObject {
 
         let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func clickComposerSubmitButtonUntilSuccessful() async {
+        for _ in 0..<20 {
+            if await clickComposerSubmitButtonIfPossible() {
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
+    private func clickComposerSubmitButtonIfPossible() async -> Bool {
+        guard let webView, let window = webView.window, window.isVisible else {
+            return false
+        }
+
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(webView)
+
+        let script = """
+        (() => {
+          const button = document.querySelector("#composer-submit-button");
+          if (!button || button.disabled) return "";
+          const label = [
+            button.getAttribute("aria-label") || "",
+            button.getAttribute("data-testid") || "",
+            button.textContent || ""
+          ].join(" ").toLowerCase();
+          if (label.includes("stop") || label.includes("cancel")) return "";
+          const style = window.getComputedStyle(button);
+          if (style.display === "none" || style.visibility === "hidden") return "";
+          const rect = button.getBoundingClientRect();
+          if (rect.width <= 0 || rect.height <= 0) return "";
+          return `${rect.left + rect.width / 2},${rect.top + rect.height / 2}`;
+        })();
+        """
+
+        guard
+            let coordinateString = try? await webView.evaluateJavaScriptStringAsync(script),
+            !coordinateString.isEmpty
+        else {
+            return false
+        }
+
+        let parts = coordinateString.split(separator: ",").compactMap { Double($0) }
+        guard parts.count == 2 else {
+            return false
+        }
+
+        let domPoint = NSPoint(x: parts[0], y: parts[1])
+        let viewPoint = NSPoint(
+            x: domPoint.x,
+            y: webView.isFlipped ? domPoint.y : webView.bounds.height - domPoint.y
+        )
+        let windowPoint = webView.convert(viewPoint, to: nil)
+        let screenPoint = window.convertPoint(toScreen: windowPoint)
+
+        postMouseClick(at: screenPoint)
+        return true
+    }
+
+    private func postMouseClick(at appKitScreenPoint: NSPoint) {
+        guard let source = CGEventSource(stateID: .hidSystemState) else {
+            return
+        }
+
+        let maximumScreenY = NSScreen.screens.reduce(appKitScreenPoint.y) { maximumY, screen in
+            max(maximumY, screen.frame.maxY)
+        }
+        let quartzPoint = CGPoint(
+            x: appKitScreenPoint.x,
+            y: maximumScreenY - appKitScreenPoint.y
+        )
+
+        let mouseDown = CGEvent(
+            mouseEventSource: source,
+            mouseType: .leftMouseDown,
+            mouseCursorPosition: quartzPoint,
+            mouseButton: .left
+        )
+        let mouseUp = CGEvent(
+            mouseEventSource: source,
+            mouseType: .leftMouseUp,
+            mouseCursorPosition: quartzPoint,
+            mouseButton: .left
+        )
+
+        mouseDown?.post(tap: CGEventTapLocation.cghidEventTap)
+        mouseUp?.post(tap: CGEventTapLocation.cghidEventTap)
     }
 }
 
@@ -63,6 +157,7 @@ struct ChatGPTWebView: NSViewRepresentable {
         )
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.isInspectable = true
         webView.navigationDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
         model.attach(webView)
@@ -87,6 +182,39 @@ struct ChatGPTWebView: NSViewRepresentable {
         if (style.display === "none" || style.visibility === "hidden") return false;
         const rect = element.getBoundingClientRect();
         return rect.width > 0 && rect.height > 0;
+      }
+
+      function removeComposerNotice() {
+        document.querySelectorAll("#thread-bottom aside").forEach((element) => {
+          element.remove();
+        });
+      }
+
+      function installComposerNoticeObserver() {
+        if (window.__gramivoxComposerNoticeObserver) {
+          return;
+        }
+
+        window.__gramivoxComposerNoticeObserver = new MutationObserver(() => {
+          removeComposerNotice();
+        });
+
+        const root = document.querySelector("#thread-bottom") || document.documentElement || document.body;
+        if (root) {
+          window.__gramivoxComposerNoticeObserver.observe(root, {
+            childList: true,
+            subtree: true
+          });
+        }
+
+        let attempts = 0;
+        const interval = setInterval(() => {
+          attempts += 1;
+          removeComposerNotice();
+          if (attempts > 20) {
+            clearInterval(interval);
+          }
+        }, 250);
       }
 
       function setElementValue(element, value) {
@@ -154,134 +282,6 @@ struct ChatGPTWebView: NSViewRepresentable {
         return false;
       }
 
-      function dispatchTrustedLikeClick(button) {
-        const events = ["pointerdown", "mousedown", "pointerup", "mouseup", "click"];
-        for (const type of events) {
-          const event = new MouseEvent(type, {
-            bubbles: true,
-            cancelable: true,
-            view: window
-          });
-          button.dispatchEvent(event);
-        }
-      }
-
-      function isLikelySendButton(button) {
-        if (!button || button.disabled || !isVisible(button)) return false;
-
-        const label = [
-          button.getAttribute("aria-label") || "",
-          button.getAttribute("data-testid") || "",
-          button.textContent || ""
-        ].join(" ").toLowerCase();
-
-        if (label.includes("voice") || label.includes("attach") || label.includes("upload") || label.includes("plus")) {
-          return false;
-        }
-
-        if (label.includes("send") || label.includes("submit") || label.includes("arrow")) {
-          return true;
-        }
-
-        const rect = button.getBoundingClientRect();
-        return rect.width <= 80 && rect.height <= 80;
-      }
-
-      function clickSendButton() {
-        const container = promptContainer();
-        const selectors = [
-          "button[data-testid='send-button']",
-          "button[data-testid*='send']",
-          "button[aria-label='Send prompt']",
-          "button[aria-label='Send message']",
-          "button[aria-label*='Send']",
-          "button[aria-label='Submit']",
-          "form button[type='submit']"
-        ];
-
-        for (const selector of selectors) {
-          const scope = container || document;
-          const button = scope.querySelector(selector) || document.querySelector(selector);
-          if (!button) continue;
-          if (!isLikelySendButton(button)) continue;
-          dispatchTrustedLikeClick(button);
-          return true;
-        }
-
-        if (container) {
-          const buttons = Array.from(container.querySelectorAll("button"))
-            .filter((button) => isLikelySendButton(button));
-
-          const rightmostButton = buttons.sort((a, b) => {
-            const rectA = a.getBoundingClientRect();
-            const rectB = b.getBoundingClientRect();
-            return rectB.right - rectA.right;
-          })[0];
-
-          if (rightmostButton) {
-            dispatchTrustedLikeClick(rightmostButton);
-            return true;
-          }
-        }
-
-        return false;
-      }
-
-      function submitPrompt() {
-        let attempts = 0;
-        const trySubmit = () => {
-          attempts += 1;
-
-          if (clickSendButton()) {
-            return;
-          }
-
-          const container = promptContainer();
-          if (container && typeof container.requestSubmit === "function") {
-            try {
-              container.requestSubmit();
-              return;
-            } catch {}
-          }
-
-          const active = document.activeElement;
-          if (active) {
-            active.focus();
-            const enterDown = new KeyboardEvent("keydown", {
-              key: "Enter",
-              code: "Enter",
-              keyCode: 13,
-              which: 13,
-              bubbles: true
-            });
-            const enterPress = new KeyboardEvent("keypress", {
-              key: "Enter",
-              code: "Enter",
-              keyCode: 13,
-              which: 13,
-              bubbles: true
-            });
-            const enterUp = new KeyboardEvent("keyup", {
-              key: "Enter",
-              code: "Enter",
-              keyCode: 13,
-              which: 13,
-              bubbles: true
-            });
-            active.dispatchEvent(enterDown);
-            active.dispatchEvent(enterPress);
-            active.dispatchEvent(enterUp);
-          }
-
-          if (attempts < 8) {
-            setTimeout(trySubmit, 180);
-            return;
-          }
-        };
-
-        setTimeout(trySubmit, 180);
-      }
-
       function getSelectionText() {
         return normalizeText(window.getSelection?.()?.toString?.() || "");
       }
@@ -319,17 +319,18 @@ struct ChatGPTWebView: NSViewRepresentable {
       }
 
       window.__gramivoxSetPrompt = (value) => {
+        installComposerNoticeObserver();
+        removeComposerNotice();
         window.__gramivoxPendingPrompt = value;
         if (tryApplyPrompt(value)) {
-          submitPrompt();
           return true;
         }
 
         if (!window.__gramivoxObserver) {
           window.__gramivoxObserver = new MutationObserver(() => {
+            removeComposerNotice();
             if (window.__gramivoxPendingPrompt && tryApplyPrompt(window.__gramivoxPendingPrompt)) {
               window.__gramivoxPendingPrompt = null;
-              submitPrompt();
             }
           });
 
@@ -345,6 +346,8 @@ struct ChatGPTWebView: NSViewRepresentable {
         return false;
       };
 
+      installComposerNoticeObserver();
+      removeComposerNotice();
       window.__gramivoxGetSelectionText = () => getSelectionText();
       window.__gramivoxGetSelectedOrLatestAssistantText = () => {
         const selected = getSelectionText();
